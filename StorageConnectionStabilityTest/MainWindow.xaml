@@ -1,0 +1,43 @@
+﻿<Window x:Class="StorageConnectionStabilityTest.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Storage Connection Stability Test v3.1"
+        Height="720" Width="1100">
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="180"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel>
+            <TextBlock Text="Storage Connection Stability Test"
+                       FontSize="22"
+                       FontWeight="Bold"/>
+            <TextBlock x:Name="OsText" Margin="0,5,0,10"/>
+        </StackPanel>
+
+        <DataGrid x:Name="DiskGrid"
+                  Grid.Row="1"
+                  AutoGenerateColumns="True"
+                  IsReadOnly="True"
+                  MaxHeight="170"
+                  SelectionChanged="DiskGrid_SelectionChanged"/>
+
+        <Button Grid.Row="2"
+                Content="Bilgileri Yenile"
+                Width="140"
+                HorizontalAlignment="Left"
+                Margin="0,10,0,10"
+                Click="Refresh_Click"/>
+
+        <TextBox x:Name="DetailBox"
+                 Grid.Row="3"
+                 FontFamily="Consolas"
+                 FontSize="13"
+                 IsReadOnly="True"
+                 VerticalScrollBarVisibility="Auto"/>
+    </Grid>
+</Window>
