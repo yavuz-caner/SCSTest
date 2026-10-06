@@ -1,21 +1,36 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <UseWPF>true</UseWPF>
-	  
-	<!-- Sürüm Numaraları -->
-	<Version>0.0.1-alpha</Version>
-	<AssemblyVersion>0.0.1</AssemblyVersion>
-	<FileVersion>0.0.1</FileVersion>
-	  
-  </PropertyGroup>
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<UseWPF>true</UseWPF>
 
-  <ItemGroup>
-    <PackageReference Include="System.Management" Version="8.0.0" />
-  </ItemGroup>
+		<!-- Sürüm Bilgileri -->
+		<Version>0.2.0-alpha</Version>
+		<AssemblyVersion>0.2.0.0</AssemblyVersion>
+		<FileVersion>0.2.0.0</FileVersion>
+
+		<!-- TEK DOSYA VE BOYUT KÜÇÜLTME AYARLARI -->
+		<PublishSingleFile>true</PublishSingleFile>
+		<SelfContained>true</SelfContained>
+		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+		<!-- C++ ve WPF Native DLL'lerini de .exe içine gömer -->
+		<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+		<!-- Gerek duyulmayan sembol/hata ayıklama dosyalarını yayınlamaz -->
+		<DebugType>embedded</DebugType>
+		<ApplicationIcon>ext-case.ico</ApplicationIcon>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <Content Include="ext-case.ico" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="System.Management" Version="8.0.0" />
+	</ItemGroup>
 
 </Project>
