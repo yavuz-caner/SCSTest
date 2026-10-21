@@ -1,18 +1,10 @@
-# StorageConnectionStabilityTest (SCSTest)
+  # StorageConnectionStabilityTest (SCSTest)
 
 >  **Ana Odak:** Bu uygulama diskin veya SSD'nin donanımsal ömrünü değil; diskin bağlı olduğu **USB kutularının (Enclosure), SATA/NVMe dönüştürücülerin, Dock Station cihazlarının ve bağlantı kablolarının** yük altındaki bağlantı kararlılığını (stability) ve kesinti durumlarını test eder.
 
 ---
 
 ### Hızlı İndirme
-
-[ Tek Dosya (.exe) İndir — v0.3.0-alpha](https://github.com/yavuz-caner/StorageConnectionStabilityTest/releases/latest/download/StorageConnectionStabilityTest.exe)
-
----
-
-### Hızlı İndirme (Giriş Yapmadan)
-
-Teknik servis veya test bilgisayarında kurulum yapmadan doğrudan çalıştırmak için aşağıdaki bağlantıya tıklayın:
 
 [ Tek Dosya (.exe) İndir — v0.3.0-alpha](https://github.com/yavuz-caner/StorageConnectionStabilityTest/releases/latest/download/StorageConnectionStabilityTest.exe)
 
