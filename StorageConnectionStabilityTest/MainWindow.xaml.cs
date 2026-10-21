@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
+using System.Linq;
 
 namespace StorageConnectionStabilityTest;
 
@@ -24,6 +25,16 @@ public partial class MainWindow : Window
 
     private readonly List<string> DeviceEvents = new();
 
+    private IntPtr DeviceNotificationHandle = IntPtr.Zero;
+
+    // Test edilen diskin bağlantı durumu
+    private volatile bool TestedDiskDisconnected = false;
+
+    private DateTime? TestedDiskDisconnectTime = null;
+
+    private string TestedDiskDisconnectPath = "";
+
+    private readonly object DisconnectSync = new();
     public MainWindow()
     {
         InitializeComponent();
@@ -37,20 +48,183 @@ public partial class MainWindow : Window
 
     private void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        WindowInteropHelper helper =
+            new WindowInteropHelper(this);
+
+        IntPtr hwnd =
+            helper.Handle;
+
         WindowSource =
-            PresentationSource.FromVisual(this) as HwndSource;
+            HwndSource.FromHwnd(hwnd);
 
         if (WindowSource != null)
         {
             WindowSource.AddHook(WndProc);
-            DeviceMonitoringEnabled = true;
         }
 
-        StatusText.Text = "Hazır";
+        DeviceMonitoringEnabled = true;
+
+        RegisterDiskDeviceNotification();
+
+        StatusText.Text = "Hazır – Cihaz izleme aktif";
+    }
+
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Locate_DevNodeW(
+        out uint pdnDevInst,
+        string pDeviceID,
+        uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Get_Parent(
+        out uint pdnDevInst,
+        uint dnDevInst,
+        uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_IDW(
+        uint dnDevInst,
+        StringBuilder buffer,
+        int bufferLen,
+        uint ulFlags);
+
+    private void RegisterDiskDeviceNotification()
+    {
+        if (WindowSource == null)
+            return;
+
+        IntPtr hwnd =
+            new WindowInteropHelper(this).Handle;
+
+        int size =
+            Marshal.SizeOf<NativeMethods.DEV_BROADCAST_DEVICEINTERFACE>();
+
+        IntPtr filter =
+            Marshal.AllocHGlobal(size);
+
+        try
+        {
+            var data =
+                new NativeMethods.DEV_BROADCAST_DEVICEINTERFACE
+                {
+                    dbcc_size = size,
+                    dbcc_devicetype =
+                        NativeMethods.DBT_DEVTYP_DEVICEINTERFACE,
+                    dbcc_reserved = 0,
+                    dbcc_classguid =
+                        NativeMethods.GUID_DEVINTERFACE_DISK
+                };
+
+            Marshal.StructureToPtr(
+                data,
+                filter,
+                false);
+
+            DeviceNotificationHandle =
+                NativeMethods.RegisterDeviceNotification(
+                    hwnd,
+                    filter,
+                    NativeMethods.DEVICE_NOTIFY_WINDOW_HANDLE);
+
+            if (DeviceNotificationHandle == IntPtr.Zero)
+            {
+                int error =
+                    Marshal.GetLastWin32Error();
+
+                StatusText.Text =
+                    $"Disk izleme başlatılamadı. Hata: {error}";
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(filter);
+        }
+    }
+
+
+    private List<string> GetPnpDeviceChain(string deviceInstanceId)
+    {
+        var chain = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(deviceInstanceId))
+            return chain;
+
+        int result = CM_Locate_DevNodeW(
+            out uint devInst,
+            deviceInstanceId,
+            0);
+
+        if (result != 0)
+        {
+            chain.Add($"PnP cihazı bulunamadı: {result}");
+            return chain;
+        }
+
+        for (int i = 0; i < 20; i++)
+        {
+            var buffer = new StringBuilder(512);
+
+            result = CM_Get_Device_IDW(
+                devInst,
+                buffer,
+                buffer.Capacity,
+                0);
+
+            if (result != 0)
+                break;
+
+            string instanceId = buffer.ToString();
+            chain.Add(instanceId);
+
+            if (instanceId.StartsWith(
+                "USB\\",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                // USB üst aygıtına ulaşıldı.
+                break;
+            }
+
+            result = CM_Get_Parent(
+                out uint parentDevInst,
+                devInst,
+                0);
+
+            if (result != 0)
+                break;
+
+            devInst = parentDevInst;
+        }
+
+        return chain;
+    }
+
+
+    private void TestPnpDeviceChain(string deviceInstanceId)
+    {
+        var chain = GetPnpDeviceChain(deviceInstanceId);
+
+        string message = chain.Count > 0
+            ? string.Join(Environment.NewLine + "↓" + Environment.NewLine, chain)
+            : "PnP cihaz zinciri bulunamadı.";
+
+        MessageBox.Show(
+            message,
+            "PnP Cihaz Zinciri",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
     }
 
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
+        if (DeviceNotificationHandle != IntPtr.Zero)
+        {
+            NativeMethods.UnregisterDeviceNotification(
+                DeviceNotificationHandle);
+
+            DeviceNotificationHandle = IntPtr.Zero;
+        }
+
         if (WindowSource != null)
         {
             WindowSource.RemoveHook(WndProc);
@@ -72,23 +246,166 @@ public partial class MainWindow : Window
         const int DBT_DEVICEARRIVAL = 0x8000;
         const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
 
-        if (msg == WM_DEVICECHANGE)
-        {
-            int eventCode = wParam.ToInt32();
+        if (msg != WM_DEVICECHANGE)
+            return IntPtr.Zero;
 
-            if (eventCode == DBT_DEVICEARRIVAL)
-            {
-                RegisterDeviceEvent(
-                    "Windows cihaz ekleme olayı algılandı.");
-            }
-            else if (eventCode == DBT_DEVICEREMOVECOMPLETE)
-            {
-                RegisterDeviceEvent(
-                    "Windows cihaz çıkarma olayı algılandı.");
-            }
+        int eventCode =
+            wParam.ToInt32();
+
+        // Sadece gerçek cihaz ekleme / çıkarma
+        // olaylarını değerlendiriyoruz.
+        if (eventCode != DBT_DEVICEARRIVAL &&
+            eventCode != DBT_DEVICEREMOVECOMPLETE)
+        {
+            return IntPtr.Zero;
         }
 
+        string eventName =
+            eventCode == DBT_DEVICEARRIVAL
+                ? "CİHAZ EKLENDİ"
+                : "CİHAZ ÇIKARILDI";
+
+        string devicePath =
+            GetDeviceInterfacePath(lParam);
+
+        if (string.IsNullOrWhiteSpace(devicePath))
+            return IntPtr.Zero;
+
+        bool matched = false;
+
+        if (DiskGrid.SelectedItem is DiskInfo selectedDisk)
+        {
+            matched =
+                IsDevicePathForDisk(
+                    devicePath,
+                    selectedDisk);
+        }
+
+        // Test edilen disk değilse olayı dikkate alma.
+        if (!matched)
+            return IntPtr.Zero;
+
+        string message =
+            $"TEST EDİLEN DİSK: {eventName}\r\n" +
+            $"{devicePath}";
+
+        // Test sırasında seçilen disk çıkarıldıysa
+        // gerçek bağlantı kesintisi olarak kaydet.
+        if (eventCode == DBT_DEVICEREMOVECOMPLETE &&
+            TestCancellation != null)
+        {
+            lock (DisconnectSync)
+            {
+                TestedDiskDisconnected = true;
+
+                TestedDiskDisconnectTime =
+                    DateTime.Now;
+
+                TestedDiskDisconnectPath =
+                    devicePath;
+            }
+
+            message +=
+                "\r\n\r\n" +
+                "!!! TEST SIRASINDA BAĞLANTI KESİNTİSİ ALGILANDI !!!";
+        }
+
+        RegisterDeviceEvent(message);
+
         return IntPtr.Zero;
+    }
+
+    private string GetDeviceInterfacePath(IntPtr lParam)
+    {
+        if (lParam == IntPtr.Zero)
+            return "";
+
+        try
+        {
+            int size =
+                Marshal.ReadInt32(lParam, 0);
+
+            int deviceType =
+                Marshal.ReadInt32(lParam, 4);
+
+            const int DBT_DEVTYP_DEVICEINTERFACE = 0x00000005;
+
+            if (deviceType != DBT_DEVTYP_DEVICEINTERFACE)
+                return "";
+
+            const int nameOffset = 28;
+
+            if (size <= nameOffset)
+                return "";
+
+            IntPtr namePtr =
+                IntPtr.Add(lParam, nameOffset);
+
+            int maxChars =
+                (size - nameOffset) / 2;
+
+            return Marshal.PtrToStringUni(
+                       namePtr,
+                       maxChars)?
+                   .TrimEnd('\0')
+                   ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private bool IsDevicePathForDisk(
+    string devicePath,
+    DiskInfo disk)
+    {
+        if (string.IsNullOrWhiteSpace(devicePath))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(disk.PNPDeviceID))
+            return false;
+
+        string path =
+            devicePath.Trim();
+
+        const string prefix = @"\\?\";
+
+        if (path.StartsWith(
+            prefix,
+            StringComparison.OrdinalIgnoreCase))
+        {
+            path = path.Substring(prefix.Length);
+        }
+
+        int guidPosition =
+            path.IndexOf(
+                "#{",
+                StringComparison.OrdinalIgnoreCase);
+
+        if (guidPosition >= 0)
+        {
+            path =
+                path.Substring(
+                    0,
+                    guidPosition);
+        }
+
+        path =
+            path.Replace(
+                '#',
+                '\\');
+
+        string pnp =
+            disk.PNPDeviceID.Trim();
+
+        return
+            path.StartsWith(
+                pnp,
+                StringComparison.OrdinalIgnoreCase) ||
+            pnp.StartsWith(
+                path,
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private void RegisterDeviceEvent(string message)
@@ -101,14 +418,17 @@ public partial class MainWindow : Window
 
         DeviceEvents.Add(eventText);
 
-        // Test sırasında kullanıcıya göster.
-        if (TestCancellation != null)
+        Dispatcher.Invoke(() =>
         {
-            Dispatcher.Invoke(() =>
-            {
-                StatusText.Text = message;
-            });
-        }
+            StatusText.Text = message;
+
+            DetailBox.Text =
+                "CANLI CİHAZ OLAYI\r\n" +
+                "=================\r\n\r\n" +
+                string.Join(
+                    "\r\n",
+                    DeviceEvents);
+        });
     }
 
     // ---------------------------------------------------------
@@ -170,6 +490,28 @@ public partial class MainWindow : Window
                 info.DeviceName = deviceName;
                 info.Manufacturer = manufacturer;
                 info.Service = service;
+
+
+                GetUsbParentInfo(
+                    info.PNPDeviceID,
+                    out string usbParentDeviceId,
+                    out string usbParentName,
+                    out string usbParentManufacturer,
+                    out string usbParentHardwareId,
+                    out string usbParentClass,
+                    out string usbParentService,
+                    out string usbParentVidPid,
+                    out string usbParentChain);
+
+                info.UsbParentDeviceId = usbParentDeviceId;
+                info.UsbParentName = usbParentName;
+                info.UsbParentManufacturer = usbParentManufacturer;
+                info.UsbParentHardwareId = usbParentHardwareId;
+                info.UsbParentClass = usbParentClass;
+                info.UsbParentService = usbParentService;
+                info.UsbParentVidPid = usbParentVidPid;
+                info.UsbParentChain = usbParentChain;
+
 
                 info.DriveLetter = GetDriveLetters(info.DeviceId);
 
@@ -358,6 +700,113 @@ public partial class MainWindow : Window
     // WINDOWS PNP CİHAZ BİLGİSİ
     // ---------------------------------------------------------
 
+
+    private void GetUsbParentInfo(
+        string startPnpDeviceId,
+        out string parentDeviceId,
+        out string parentName,
+        out string parentManufacturer,
+        out string parentHardwareId,
+        out string parentClass,
+        out string parentService,
+        out string parentVidPid,
+        out string parentChain)
+    {
+        parentDeviceId = "-";
+        parentName = "-";
+        parentManufacturer = "-";
+        parentHardwareId = "-";
+        parentClass = "-";
+        parentService = "-";
+        parentVidPid = "-";
+        parentChain = "-";
+
+        if (string.IsNullOrWhiteSpace(startPnpDeviceId))
+            return;
+
+        try
+        {
+            // Windows'un gerçek PnP ağacından cihaz zincirini al.
+            List<string> chain =
+                GetPnpDeviceChain(startPnpDeviceId);
+
+            if (chain.Count > 0)
+            {
+                parentChain =
+                    string.Join(Environment.NewLine, chain);
+            }
+
+            // Zincirdeki USB üst aygıtını bul.
+            string usbId = chain.FirstOrDefault(
+                id => id.StartsWith(
+                    @"USB\",
+                    StringComparison.OrdinalIgnoreCase)) ?? "";
+
+            if (string.IsNullOrWhiteSpace(usbId))
+                return;
+
+            parentDeviceId = usbId;
+            parentVidPid = ExtractVidPid(usbId);
+
+            // USB üst aygıtının Windows tarafından bildirilen
+            // adını ve diğer özelliklerini bul.
+            using var searcher =
+                new ManagementObjectSearcher(
+                    "SELECT PNPDeviceID, Name, Manufacturer, " +
+                    "HardwareID, PNPClass, Service " +
+                    "FROM Win32_PnPEntity");
+
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                string currentId =
+                    obj["PNPDeviceID"]?.ToString() ?? "";
+
+                if (!string.Equals(
+                    currentId,
+                    usbId,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                parentName =
+                    obj["Name"]?.ToString() ?? "-";
+
+                parentManufacturer =
+                    obj["Manufacturer"]?.ToString() ?? "-";
+
+                parentClass =
+                    obj["PNPClass"]?.ToString() ?? "-";
+
+                parentService =
+                    obj["Service"]?.ToString() ?? "-";
+
+                if (obj["HardwareID"] is Array hardwareIds)
+                {
+                    var ids = new List<string>();
+
+                    foreach (object item in hardwareIds)
+                    {
+                        if (item != null)
+                            ids.Add(item.ToString() ?? "");
+                    }
+
+                    parentHardwareId =
+                        ids.Count > 0
+                            ? string.Join(" ; ", ids)
+                            : "-";
+                }
+
+                break;
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                "GetUsbParentInfo HATASI: " + ex);
+        }
+    }
+
     private void GetUsbDeviceInfo(
         string pnpDeviceId,
         out string deviceName,
@@ -447,6 +896,30 @@ Windows Service
 
 Seri No
 {d.SerialNumber}
+
+USB PARENT CİHAZ
+{d.UsbParentName}
+
+USB PARENT ÜRETİCİ
+{d.UsbParentManufacturer}
+
+USB PARENT VID / PID
+{d.UsbParentVidPid}
+
+USB PARENT HARDWARE ID
+{d.UsbParentHardwareId}
+
+USB PARENT SINIFI
+{d.UsbParentClass}
+
+USB PARENT WINDOWS SERVICE
+{d.UsbParentService}
+
+USB PARENT PNP DEVICE ID
+{d.UsbParentDeviceId}
+
+PNP CİHAZ ZİNCİRİ
+{d.UsbParentChain}
 
 NOT:
 Kontrolcü/bridge çipi Windows tarafından doğrudan
@@ -552,6 +1025,12 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
         SetTestRunning(true);
 
         DeviceEvents.Clear();
+        lock (DisconnectSync)
+        {
+            TestedDiskDisconnected = false;
+            TestedDiskDisconnectTime = null;
+            TestedDiskDisconnectPath = "";
+        }
 
         StatusText.Text = "Test başlatılıyor...";
 
@@ -576,7 +1055,33 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
         }
     }
 
+    private async Task<bool> WaitForDisconnectAfterIoErrorAsync(
+    DateTime ioErrorTime,
+    int waitMilliseconds = 2000)
+    {
+        const int checkInterval = 50;
 
+        int elapsed = 0;
+
+        while (elapsed < waitMilliseconds)
+        {
+            lock (DisconnectSync)
+            {
+                if (TestedDiskDisconnected &&
+                    TestedDiskDisconnectTime.HasValue &&
+                    TestedDiskDisconnectTime.Value >= ioErrorTime)
+                {
+                    return true;
+                }
+            }
+
+            await Task.Delay(checkInterval);
+
+            elapsed += checkInterval;
+        }
+
+        return false;
+    }
     // ---------------------------------------------------------
     // TEST MOTORU
     // ---------------------------------------------------------
@@ -709,6 +1214,21 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
             {
                 token.ThrowIfCancellationRequested();
 
+                if (TestedDiskDisconnected)
+                {
+                    resultStatus =
+                        "BAĞLANTI KESİNTİSİ";
+
+                    failureTime =
+                        TestedDiskDisconnectTime ?? DateTime.Now;
+
+                    failureReason =
+                        "Test sırasında seçilen depolama cihazının " +
+                        "Windows cihaz çıkarma olayı algılandı.";
+
+                    break;
+                }
+
                 int toWrite =
                     (int)Math.Min(
                         bufferSize,
@@ -728,13 +1248,29 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
                 chunkWatch.Stop();
 
                 if (!success ||
-                    written != toWrite)
+    written != toWrite)
                 {
                     int error =
                         Marshal.GetLastWin32Error();
 
-                    failureTime =
+                    DateTime ioErrorTime =
                         DateTime.Now;
+
+                    bool disconnectDetected =
+                        TestedDiskDisconnected;
+
+                    if (!disconnectDetected)
+                    {
+                        disconnectDetected =
+                            await WaitForDisconnectAfterIoErrorAsync(
+                                ioErrorTime);
+                    }
+
+                    failureTime =
+                        disconnectDetected &&
+                        TestedDiskDisconnectTime.HasValue
+                            ? TestedDiskDisconnectTime.Value
+                            : ioErrorTime;
 
                     win32Error = error;
 
@@ -742,16 +1278,49 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
                         new System.ComponentModel.Win32Exception(error)
                             .Message;
 
-                    failureReason =
-                        "Dosya yazma işlemi sırasında Windows I/O hatası oluştu.";
+                    totalWritten += written;
 
-                    resultStatus =
-                        "BAĞLANTI / I/O HATASI";
+                    if (disconnectDetected)
+                    {
+                        failureReason =
+                            "Test sırasında seçilen depolama cihazının " +
+                            "bağlantı kesintisi algılandı. Windows I/O " +
+                            "hatası ile cihaz çıkarma olayı aynı test oturumu " +
+                            "içerisinde ilişkilendirildi.";
+
+                        resultStatus =
+                            "BAĞLANTI KESİNTİSİ";
+                    }
+                    else
+                    {
+                        failureReason =
+                            "Dosya yazma işlemi sırasında Windows I/O hatası " +
+                            "oluştu; test edilen cihazın çıkarıldığına dair " +
+                            "cihaz olayı algılanmadı.";
+
+                        resultStatus =
+                            "BAĞLANTI / I/O HATASI";
+                    }
 
                     break;
                 }
 
                 totalWritten += written;
+
+                if (TestedDiskDisconnected)
+                {
+                    resultStatus =
+                        "BAĞLANTI KESİNTİSİ";
+
+                    failureTime =
+                        TestedDiskDisconnectTime ?? DateTime.Now;
+
+                    failureReason =
+                        "Test sırasında seçilen depolama cihazının " +
+                        "Windows cihaz çıkarma olayı algılandı.";
+
+                    break;
+                }
 
                 double seconds =
                     Math.Max(
@@ -772,8 +1341,24 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
                     int error =
                         Marshal.GetLastWin32Error();
 
-                    failureTime =
+                    DateTime ioErrorTime =
                         DateTime.Now;
+
+                    bool disconnectDetected =
+                        TestedDiskDisconnected;
+
+                    if (!disconnectDetected)
+                    {
+                        disconnectDetected =
+                            await WaitForDisconnectAfterIoErrorAsync(
+                                ioErrorTime);
+                    }
+
+                    failureTime =
+                        disconnectDetected &&
+                        TestedDiskDisconnectTime.HasValue
+                            ? TestedDiskDisconnectTime.Value
+                            : ioErrorTime;
 
                     win32Error = error;
 
@@ -781,11 +1366,24 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
                         new System.ComponentModel.Win32Exception(error)
                             .Message;
 
-                    failureReason =
-                        "FlushFileBuffers sırasında Windows I/O hatası oluştu.";
+                    if (disconnectDetected)
+                    {
+                        failureReason =
+                            "Test sırasında depolama cihazı bağlantısı kesildi; " +
+                            "FlushFileBuffers işlemi başarısız oldu.";
 
-                    resultStatus =
-                        "BAĞLANTI / I/O HATASI";
+                        resultStatus =
+                            "BAĞLANTI KESİNTİSİ";
+                    }
+                    else
+                    {
+                        failureReason =
+                            "FlushFileBuffers sırasında Windows I/O hatası oluştu; " +
+                            "cihaz çıkarma olayı algılanmadı.";
+
+                        resultStatus =
+                            "BAĞLANTI / I/O HATASI";
+                    }
 
                     break;
                 }
@@ -1037,6 +1635,7 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
 
         sb.AppendLine();
 
+
         sb.AppendLine("KONTROLCÜ / USB BAĞLANTISI");
         sb.AppendLine("---------------------------");
 
@@ -1056,6 +1655,42 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
             $"PNP Device ID       : {disk.PNPDeviceID}");
 
         sb.AppendLine();
+
+        sb.AppendLine("USB PARENT BİLGİLERİ");
+        sb.AppendLine("--------------------");
+
+        sb.AppendLine(
+            $"Cihaz adı           : {disk.UsbParentName}");
+
+        sb.AppendLine(
+            $"Üretici             : {disk.UsbParentManufacturer}");
+
+        sb.AppendLine(
+            $"VID / PID           : {disk.UsbParentVidPid}");
+
+        sb.AppendLine(
+            $"Hardware ID         : {disk.UsbParentHardwareId}");
+
+        sb.AppendLine(
+            $"Sınıf               : {disk.UsbParentClass}");
+
+        sb.AppendLine(
+            $"Windows Service     : {disk.UsbParentService}");
+
+        sb.AppendLine(
+            $"PNP Device ID       : {disk.UsbParentDeviceId}");
+
+        sb.AppendLine(
+            $"PNP cihaz zinciri   : {disk.UsbParentChain}");
+
+        sb.AppendLine();
+
+        sb.AppendLine(
+            "Not: Kontrolcü/bridge çipi Windows tarafından açıkça " +
+            "tanımlanmıyorsa çip modeli hakkında tahmin yapılmamıştır.");
+
+        sb.AppendLine();
+
 
         sb.AppendLine("TEST YÖNTEMİ");
         sb.AppendLine("------------");
@@ -1112,6 +1747,24 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
         sb.AppendLine(
             $"Durum              : {status}");
 
+        if (TestedDiskDisconnected)
+        {
+            sb.AppendLine(
+                "Bağlantı kesintisi : EVET");
+
+            sb.AppendLine(
+                $"Kesinti zamanı     : " +
+                $"{TestedDiskDisconnectTime:dd.MM.yyyy HH:mm:ss.fff}");
+
+            sb.AppendLine(
+                $"Cihaz yolu         : {TestedDiskDisconnectPath}");
+        }
+        else
+        {
+            sb.AppendLine(
+                "Bağlantı kesintisi : HAYIR");
+        }
+        
         if (failureTime.HasValue)
         {
             sb.AppendLine(
@@ -1181,6 +1834,27 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
                 $"bağlantı/I/O kesintisi tespit edilmedi.";
         }
 
+        if (status == "BAĞLANTI KESİNTİSİ")
+        {
+            string time =
+                failureTime.HasValue
+                    ? failureTime.Value.ToString(
+                        "dd.MM.yyyy HH:mm:ss.fff")
+                    : "-";
+
+            string ioResult =
+                errorCode.HasValue
+                    ? $"{errorCode.Value} ({errorMessage})"
+                    : "I/O hatası alınmadı";
+
+            return
+                $"Test: {FormatSize(targetBytes)} ardışık yazma testi. " +
+                $"Sonuç: {FormatSize(written)} veri yazıldıktan sonra " +
+                $"test edilen depolama bağlantısının kesildiği tespit edildi. " +
+                $"Olay zamanı: {time}. " +
+                $"Windows I/O sonucu: {ioResult}.";
+        }
+
         if (status == "BAĞLANTI / I/O HATASI")
         {
             string time =
@@ -1192,9 +1866,9 @@ açıkça bildirilmezse tahmin yapılmayacaktır.";
             return
                 $"Test: {FormatSize(targetBytes)} ardışık yazma testi. " +
                 $"Sonuç: {FormatSize(written)} veri sonrasında " +
-                $"bağlantı/I/O hatası tespit edildi. " +
-                $"Olay: {time}, Windows hata kodu: {errorCode} " +
-                $"({errorMessage}).";
+                $"Windows I/O hatası tespit edildi; cihaz çıkarma olayı " +
+                $"algılanmadı. Olay: {time}, Windows hata kodu: " +
+                $"{errorCode} ({errorMessage}).";
         }
 
         if (status == "KULLANICI TARAFINDAN DURDURULDU")
@@ -1292,6 +1966,30 @@ Windows Service
 
 Seri No
 {d.SerialNumber}
+
+USB PARENT CİHAZ
+{d.UsbParentName}
+
+USB PARENT ÜRETİCİ
+{d.UsbParentManufacturer}
+
+USB PARENT VID / PID
+{d.UsbParentVidPid}
+
+USB PARENT HARDWARE ID
+{d.UsbParentHardwareId}
+
+USB PARENT SINIFI
+{d.UsbParentClass}
+
+USB PARENT WINDOWS SERVICE
+{d.UsbParentService}
+
+USB PARENT PNP DEVICE ID
+{d.UsbParentDeviceId}
+
+PNP CİHAZ ZİNCİRİ
+{d.UsbParentChain}
 
 Kontrolcü / bridge:
 Windows tarafından doğrudan çip modeli bildiriliyorsa
@@ -1440,6 +2138,30 @@ public class DiskInfo
     public string Manufacturer { get; set; } = "";
 
     public string Service { get; set; } = "";
+
+    public string DeviceInterfacePath { get; set; } = "";
+
+    public string VolumeGuid { get; set; } = "";
+
+    // ---------------------------------------------------------
+    // USB PARENT / CONTROLLER BİLGİLERİ - v0.3.0
+    // ---------------------------------------------------------
+
+    public string UsbParentDeviceId { get; set; } = "";
+
+    public string UsbParentName { get; set; } = "";
+
+    public string UsbParentManufacturer { get; set; } = "";
+
+    public string UsbParentHardwareId { get; set; } = "";
+
+    public string UsbParentClass { get; set; } = "";
+
+    public string UsbParentService { get; set; } = "";
+
+    public string UsbParentVidPid { get; set; } = "";
+
+    public string UsbParentChain { get; set; } = "";
 }
 
 
@@ -1470,6 +2192,41 @@ internal static class NativeMethods
     public const uint FILE_FLAG_SEQUENTIAL_SCAN =
         0x08000000;
 
+    public const int DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+
+    public const int DBT_DEVTYP_DEVICEINTERFACE = 0x00000005;
+
+    public static readonly Guid GUID_DEVINTERFACE_DISK =
+        new Guid("53f56307-b6bf-11d0-94f2-00a0c91efb8b");
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DEV_BROADCAST_DEVICEINTERFACE
+    {
+        public int dbcc_size;
+        public int dbcc_devicetype;
+        public int dbcc_reserved;
+
+        public Guid dbcc_classguid;
+
+        // dbcc_name değişken uzunlukta olduğu için
+        // burada sabit alan kullanmıyoruz.
+    }
+
+    [DllImport(
+        "user32.dll",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    public static extern IntPtr RegisterDeviceNotification(
+        IntPtr hRecipient,
+        IntPtr NotificationFilter,
+        int Flags);
+
+    [DllImport(
+        "user32.dll",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnregisterDeviceNotification(
+        IntPtr Handle);
 
     [DllImport(
         "kernel32.dll",
